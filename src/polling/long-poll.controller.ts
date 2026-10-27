@@ -1,7 +1,8 @@
-import { Controller, Get, Param, Query, Res } from '@nestjs/common';
+import { Controller, Get, Query, Res, UseGuards } from '@nestjs/common';
 import type { Response } from 'express';
 import { MessagesService } from '../messages/messages.service';
 import { PresenceService } from '../presence/presence.service';
+import { Auth, AuthGuard, CurrentAuth } from '../auth/auth';
 
 /**
  * LONG POLLING
@@ -13,6 +14,7 @@ import { PresenceService } from '../presence/presence.service';
  * - one held connection per client, timeouts must stay below proxy/LB idle limits
  */
 @Controller('long-poll')
+@UseGuards(AuthGuard)
 export class LongPollController {
   private readonly MAX_TIMEOUT_MS = 30_000;
 
@@ -21,14 +23,14 @@ export class LongPollController {
     private readonly presence: PresenceService,
   ) {}
 
-  @Get(':userId')
+  @Get()
   async poll(
-    @Param('userId') userId: string,
+    @CurrentAuth() { userId }: Auth,
     @Query('since') since = '0',
     @Query('timeout') timeout = '25000',
     @Res({ passthrough: true }) res: Response,
   ) {
-    this.presence.touchPoll(userId);
+    await this.presence.touchPoll(userId);
 
     // If the client disconnects (tab closed, user went offline), stop waiting.
     // Note: listen on res 'close', not req 'close' — the latter fires once the body is read.
@@ -43,7 +45,7 @@ export class LongPollController {
       timeoutMs,
       abort.signal,
     );
-    this.presence.touchPoll(userId);
+    await this.presence.touchPoll(userId);
     return { messages, heldForMs: Date.now() - started };
   }
 }

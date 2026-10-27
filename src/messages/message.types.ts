@@ -3,8 +3,10 @@ export interface ChatMessage {
   id: string;
   /** Per-recipient, monotonically increasing. Used for ordering and as a polling cursor. */
   seq: number;
+  /** 'chat' carries { text }; 'seen' is a read receipt carrying { messageId }. */
+  kind: 'chat' | 'seen';
   from: string;
   to: string;
-  text: string;
+  payload: Record<string, unknown>;
   createdAt: string;
 }

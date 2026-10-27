@@ -1,49 +1,61 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import type Redis from 'ioredis';
+import { REDIS } from '../infra/infra.module';
 
 /**
- * "Is the user online?" means different things per transport:
- *  - WebSocket: we hold an open connection, so we know exactly.
- *  - Polling:  we only know when they last asked. We guess "online" if they
- *              polled within a grace window (heartbeat-style).
+ * "Is the user online?" has to be answered across instances, so it lives in Redis:
+ * one sorted set per user, member = connection id, score = expiry time.
+ *  - WebSocket/SSE: we hold the connection; a heartbeat keeps the entry alive, and a
+ *                   crashed instance's entries simply expire.
+ *  - Polling:       we only know when they last asked, so the 'poll' entry lives a grace window.
  */
 @Injectable()
-export class PresenceService {
-  private readonly sockets = new Map<string, Set<string>>();
-  private readonly lastPoll = new Map<string, number>();
+export class PresenceService implements OnModuleInit, OnModuleDestroy {
+  private readonly CONN_TTL_MS = 60_000;
   private readonly POLL_GRACE_MS = 35_000;
+  private readonly local = new Map<string, string>(); // connection id -> userId
+  private timer?: NodeJS.Timeout;
 
-  addSocket(userId: string, socketId: string) {
-    if (!this.sockets.has(userId)) this.sockets.set(userId, new Set());
-    this.sockets.get(userId)!.add(socketId);
+  constructor(@Inject(REDIS) private readonly redis: Redis) {}
+
+  onModuleInit() {
+    this.timer = setInterval(() => this.local.forEach((u, id) => this.touch(u, id)), 20_000);
+  }
+  onModuleDestroy() {
+    clearInterval(this.timer);
   }
 
-  removeSocket(userId: string, socketId: string) {
-    const set = this.sockets.get(userId);
-    set?.delete(socketId);
-    if (set?.size === 0) this.sockets.delete(userId);
+  private touch(userId: string, id: string, ttl = this.CONN_TTL_MS) {
+    return this.redis.zadd(`presence:${userId}`, Date.now() + ttl, id).catch(() => undefined);
+  }
+
+  addConnection(userId: string, id: string) {
+    this.local.set(id, userId);
+    return this.touch(userId, id);
+  }
+
+  removeConnection(userId: string, id: string) {
+    this.local.delete(id);
+    return this.redis.zrem(`presence:${userId}`, id);
   }
 
   touchPoll(userId: string) {
-    this.lastPoll.set(userId, Date.now());
+    return this.touch(userId, 'poll', this.POLL_GRACE_MS);
   }
 
-  isOnline(userId: string): boolean {
-    if (this.sockets.has(userId)) return true;
-    const last = this.lastPoll.get(userId);
-    return last !== undefined && Date.now() - last < this.POLL_GRACE_MS;
+  async isOnline(userId: string): Promise<boolean> {
+    const key = `presence:${userId}`;
+    await this.redis.zremrangebyscore(key, '-inf', Date.now());
+    return (await this.redis.zcard(key)) > 0;
   }
 
-  snapshot() {
-    const users = new Set([...this.sockets.keys(), ...this.lastPoll.keys()]);
-    return Object.fromEntries(
-      [...users].map((u) => [
-        u,
-        {
-          online: this.isOnline(u),
-          sockets: this.sockets.get(u)?.size ?? 0,
-          lastPollMsAgo: this.lastPoll.has(u) ? Date.now() - this.lastPoll.get(u)! : null,
-        },
-      ]),
-    );
+  async snapshot() {
+    const out: Record<string, { online: boolean; connections: number }> = {};
+    for (const key of await this.redis.keys('presence:*')) {
+      const user = key.slice('presence:'.length);
+      const ids = await this.redis.zrangebyscore(key, Date.now(), '+inf');
+      out[user] = { online: ids.length > 0, connections: ids.filter((i) => i !== 'poll').length };
+    }
+    return out;
   }
 }

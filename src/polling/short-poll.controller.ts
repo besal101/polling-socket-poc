@@ -1,6 +1,7 @@
-import { Controller, Get, Param, Query } from '@nestjs/common';
+import { Controller, Get, Query, UseGuards } from '@nestjs/common';
 import { MessagesService } from '../messages/messages.service';
 import { PresenceService } from '../presence/presence.service';
+import { Auth, AuthGuard, CurrentAuth } from '../auth/auth';
 
 /**
  * SHORT POLLING
@@ -11,15 +12,16 @@ import { PresenceService } from '../presence/presence.service';
  * - latency up to N seconds, lots of wasted requests
  */
 @Controller('short-poll')
+@UseGuards(AuthGuard)
 export class ShortPollController {
   constructor(
     private readonly messages: MessagesService,
     private readonly presence: PresenceService,
   ) {}
 
-  @Get(':userId')
-  poll(@Param('userId') userId: string, @Query('since') since = '0') {
-    this.presence.touchPoll(userId);
-    return { messages: this.messages.getSince(userId, Number(since) || 0) };
+  @Get()
+  async poll(@CurrentAuth() { userId }: Auth, @Query('since') since = '0') {
+    await this.presence.touchPoll(userId);
+    return { messages: await this.messages.getSince(userId, Number(since) || 0) };
   }
 }

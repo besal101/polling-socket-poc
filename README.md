@@ -91,13 +91,19 @@ Two cursor styles are shown on purpose. Polling uses a client-held cursor (`sinc
 3. Do the same with long polling, then click "Clear this device’s local state" and go online again. The un-acked messages are redelivered from seq 0, just like a fresh install on a new phone.
 4. Restart the server. Everything is gone, because the store is in memory. That is the first thing to fix for production.
 
-## Exercises (roughly in order of difficulty)
+## What the exercises became
 
-1. **Persist the inbox** in Redis or Postgres (table `messages(id, recipient, seq, payload, created_at, acked_at)` with an index on `(recipient, seq)`).
-2. **Add an SSE endpoint** with Nest's `@Sse()` decorator and an RxJS `Observable` built from `onMessage()`.
-3. **Scale out**: run two instances behind nginx, add `@socket.io/redis-adapter`, and move the `EventEmitter` in `MessagesService` to Redis pub/sub so a message sent on instance A reaches a socket on instance B.
-4. **Per-device cursors**: today, acking from one tab removes the message for every tab. Track acks per `(user, device)` so a phone and a laptop both get the message.
-5. **Push notifications** for users who are truly offline: if `presence.isOnline(to)` is false, enqueue an FCM / APNs notification. The push only says "you have a message"; the app then syncs over the normal channel to fetch it.
-6. **Authentication**: replace `handshake.auth.userId` with a JWT verified in a guard or in `handleConnection`.
-7. **Expiry and limits**: cap the inbox size, expire messages after N days, and add rate limiting to `POST /messages`.
-8. **Read receipts**: a second ack type ("seen") sent back to the original sender, which is itself a message that may need offline delivery.
+Run it: `docker compose up -d --build`, open http://localhost:8080 (nginx in front of `app1` and `app2`, Postgres, Redis). Self-check: `node scripts/e2e.mjs`.
+
+| Exercise | Where |
+|---|---|
+| Persistent inbox | Postgres `messages` (`UNIQUE (recipient, seq)` is the index); seq assigned atomically via `inbox_seq`. Schema is created on boot in `src/infra/infra.module.ts`. |
+| SSE | `src/realtime/sse.controller.ts`, `GET /sse` (RxJS `Observable` over `onMessage()`) |
+| Scale out | `MessagesService.send` publishes to Redis `inbox:<user>`; every instance re-emits locally. Presence is in Redis too. `RedisIoAdapter` covers socket.io rooms (delivery itself does not depend on it). |
+| Per-device acks | `message_acks(message_id, device_id)`. Devices send `X-Device-Id` / `?device=` / `auth.deviceId`. This replaces `messages.acked_at`. |
+| Push | `PushService`: offline recipient gets a content-free FCM push (APNs via Firebase). Set `GOOGLE_APPLICATION_CREDENTIALS`; otherwise it only logs. Apps register with `POST /messages/push-token`. |
+| Auth | HS256 JWT (`JWT_SECRET`) checked by `AuthGuard` and in `ChatGateway.handleConnection`. The sender is always the token's user. |
+| Expiry and limits | `MESSAGE_TTL_DAYS` (7), `INBOX_MAX` (1000), `SENDS_PER_MIN` (30, per sender, shared across instances; applies to HTTP and socket sends). |
+| Read receipts | `POST /messages/seen {messageId, from}` stores a `kind: 'seen'` message for the original sender, delivered and pushed like any other. |
+
+Known shortcuts: `POST /auth/token` mints a token for any userId (no login), and the rate limit is a fixed window.

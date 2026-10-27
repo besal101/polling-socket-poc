@@ -72,6 +72,7 @@
   <div class="modes" role="group" aria-label="Transport">
     <button data-mode="short" aria-pressed="true">Short polling</button>
     <button data-mode="long" aria-pressed="false">Long polling</button>
+    <button data-mode="sse" aria-pressed="false">SSE</button>
     <button data-mode="ws" aria-pressed="false">WebSocket</button>
   </div>
 </header>
@@ -118,6 +119,13 @@
 const $ = (id) => document.getElementById(id);
 const state = { mode: 'short', online: false, abort: null, socket: null, stats: { req: 0, empty: 0, recv: 0, dup: 0 } };
 const me = () => $('me').value;
+// One id per browser tab = one "device": acking in this tab never removes messages from another tab.
+const deviceId = (() => { try { return sessionStorage.deviceId ??= crypto.randomUUID(); } catch { return crypto.randomUUID(); } })();
+let token = null;
+async function api(url, opts = {}) {
+  token ??= (await (await fetch('/auth/token', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ userId: me() }) })).json()).token;
+  return { ...opts, headers: { ...opts.headers, Authorization: `Bearer ${token}`, 'X-Device-Id': deviceId } };
+}
 const peer = () => $('peer').value;
 
 // ---------- Client-side delivery state (survives reloads, like a mobile app's local DB) ----------
@@ -139,6 +147,14 @@ function persist() {
 
 // Idempotent handler: at-least-once delivery + this = effectively-once from the user's view.
 function handleIncoming(msg, via) {
+  if (msg.kind === 'seen') {
+    const m = history.find((h) => h.id === msg.payload.messageId);
+    if (m) m.seen = true;
+    log(`✓✓ ${msg.from} saw a message`, 'ok');
+    lastSeq = Math.max(lastSeq, msg.seq);
+    persist(); render();
+    return;
+  }
   if (seen.has(msg.id)) {
     state.stats.dup++;
     log(`duplicate #${msg.seq} ignored${msg.attempt > 1 ? ` (server retry ${msg.attempt})` : ''}`, 'warn');
@@ -147,9 +163,18 @@ function handleIncoming(msg, via) {
     history.push(msg);
     state.stats.recv++;
     log(`#${msg.seq} from ${msg.from} via ${via}`, 'ok');
+    sendSeen(msg);
   }
   lastSeq = Math.max(lastSeq, msg.seq);
   persist(); render(); stats();
+}
+
+// Read receipt: tell the sender we saw it (only when the tab is showing that conversation).
+async function sendSeen(msg) {
+  if (msg.from !== peer()) return;
+  try {
+    await fetch('/messages/seen', await api('', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messageId: msg.id, from: msg.from }) }));
+  } catch {}
 }
 
 // ---------- Wire log ----------
@@ -169,7 +194,8 @@ async function tracedFetch(label, url, opts = {}) {
   const started = Date.now();
   const tick = setInterval(() => (bar.style.width = Math.min(100, (Date.now() - started) / 300) + '%'), 200);
   try {
-    const res = await fetch(url, opts);
+    const res = await fetch(url, await api(url, opts));
+    if (res.status === 401) token = null; // expired: fetch a fresh one on the next request
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   } finally {
@@ -188,7 +214,7 @@ async function receiveBatch(messages, via) {
   if ($('dropAcks').checked) { log(`ack skipped for up to #${lastSeq}`, 'drop'); return; }
   await tracedFetch(`POST /messages/ack upTo=${lastSeq}`, '/messages/ack', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ userId: me(), upToSeq: lastSeq }),
+    body: JSON.stringify({ upToSeq: lastSeq }),
   });
 }
 const sleep = (ms, signal) => new Promise((r) => { const t = setTimeout(r, ms); signal.addEventListener('abort', () => { clearTimeout(t); r(); }); });
@@ -196,7 +222,7 @@ const sleep = (ms, signal) => new Promise((r) => { const t = setTimeout(r, ms); 
 async function shortPollLoop(signal) {
   while (!signal.aborted) {
     try {
-      const { messages } = await tracedFetch(`GET /short-poll/${me()}?since=${lastSeq}`, `/short-poll/${me()}?since=${lastSeq}`, { signal });
+      const { messages } = await tracedFetch(`GET /short-poll?since=${lastSeq}`, `/short-poll?since=${lastSeq}`, { signal });
       await receiveBatch(messages, 'short poll');
     } catch (e) { if (signal.aborted) break; log(`error: ${e.message}`, 'drop'); }
     await sleep(Number($('interval').value) || 3000, signal);
@@ -207,7 +233,7 @@ async function longPollLoop(signal) {
   let backoff = 1000;
   while (!signal.aborted) {
     try {
-      const url = `/long-poll/${me()}?since=${lastSeq}&timeout=25000`;
+      const url = `/long-poll?since=${lastSeq}&timeout=25000`;
       const { messages } = await tracedFetch(`GET ${url.replace('&timeout=25000', '')}  (held open)`, url, { signal });
       backoff = 1000;
       await receiveBatch(messages, 'long poll');
@@ -222,8 +248,9 @@ async function longPollLoop(signal) {
 }
 
 // ---------- WebSocket ----------
-function connectSocket() {
-  const socket = io({ auth: { userId: me() }, transports: ['websocket'] });
+async function connectSocket() {
+  await api('');
+  const socket = io({ auth: { token, deviceId }, transports: ['websocket'] });
   state.socket = socket;
   socket.on('connect', () => {
     log(`socket connected (${socket.id})`, 'ok');
@@ -239,11 +266,29 @@ function connectSocket() {
   socket.on('connect_error', (e) => log(`connect error: ${e.message}`, 'drop'));
 }
 
+// ---------- SSE ----------
+async function connectSse() {
+  await api('');
+  const es = new EventSource(`/sse?token=${token}&device=${deviceId}`); // EventSource cannot set headers
+  state.sse = es;
+  es.onopen = () => log('SSE stream open', 'ok');
+  es.addEventListener('message', async (e) => {
+    const msg = JSON.parse(e.data);
+    log(`⇠ event: message #${msg.seq}`);
+    handleIncoming(msg, 'SSE');
+    if ($('dropAcks').checked) log(`ack withheld for #${msg.seq}`, 'drop');
+    else await tracedFetch(`POST /messages/ack upTo=${msg.seq}`, '/messages/ack', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ upToSeq: msg.seq }) });
+  });
+  es.onerror = () => log('SSE error, the browser will reconnect and the server replays un-acked messages', 'warn');
+}
+
 // ---------- Online / offline ----------
 function goOnline() {
   state.online = true;
   log(`going online with ${label(state.mode)}`, 'ok');
+  token = null;
   if (state.mode === 'ws') connectSocket();
+  else if (state.mode === 'sse') connectSse();
   else {
     state.abort = new AbortController();
     (state.mode === 'short' ? shortPollLoop : longPollLoop)(state.abort.signal);
@@ -254,10 +299,11 @@ function goOffline() {
   state.online = false;
   state.abort?.abort(); state.abort = null;
   state.socket?.disconnect(); state.socket = null;
+  state.sse?.close(); state.sse = null;
   log('offline: messages sent to you now wait in your server inbox', 'warn');
   ui();
 }
-const label = (m) => ({ short: 'short polling', long: 'long polling', ws: 'WebSocket' })[m];
+const label = (m) => ({ short: 'short polling', long: 'long polling', sse: 'SSE', ws: 'WebSocket' })[m];
 
 // ---------- Sending ----------
 $('sendForm').addEventListener('submit', async (e) => {
@@ -265,7 +311,7 @@ $('sendForm').addEventListener('submit', async (e) => {
   const text = $('text').value.trim();
   if (!text) return;
   $('text').value = '';
-  const mine = { id: 'local-' + Date.now(), from: me(), to: peer(), text, createdAt: new Date().toISOString(), mine: true };
+  const mine = { id: 'local-' + Date.now(), from: me(), to: peer(), payload: { text }, createdAt: new Date().toISOString(), mine: true };
   history.push(mine); persist(); render();
   try {
     let res;
@@ -275,9 +321,10 @@ $('sendForm').addEventListener('submit', async (e) => {
     } else {
       res = await tracedFetch('POST /messages', '/messages', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ from: me(), to: peer(), text }),
+        body: JSON.stringify({ to: peer(), text }),
       });
     }
+    mine.id = res.message.id; persist(); // the server id lets a later read receipt find this message
     log(`stored as ${peer()}’s #${res.message.seq}; ${peer()} is ${res.recipientOnline ? 'online' : 'offline, will get it on return'}`, res.recipientOnline ? 'ok' : 'warn');
   } catch (err) { log(`send failed: ${err.message}`, 'drop'); }
 });
@@ -293,8 +340,8 @@ function render() {
     const div = document.createElement('div');
     div.className = 'msg' + (m.mine ? ' mine' : '');
     div.innerHTML = '<span></span><small></small>';
-    div.querySelector('span').textContent = m.text;
-    div.querySelector('small').textContent = `${new Date(m.createdAt).toLocaleTimeString()}${m.seq ? ' · #' + m.seq : ''}`;
+    div.querySelector('span').textContent = m.payload?.text ?? m.text;
+    div.querySelector('small').textContent = `${new Date(m.createdAt).toLocaleTimeString()}${m.seq ? ' · #' + m.seq : ''}${m.seen ? ' · ✓✓ seen' : ''}`;
     box.append(div);
   }
   box.scrollTop = box.scrollHeight;

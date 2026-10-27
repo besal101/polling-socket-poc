@@ -8,6 +8,7 @@ import {
   WebSocketGateway,
 } from '@nestjs/websockets';
 import type { Socket } from 'socket.io';
+import { JwtService } from '@nestjs/jwt';
 import { MessagesService } from '../messages/messages.service';
 import { PresenceService } from '../presence/presence.service';
 import { ChatMessage } from '../messages/message.types';
@@ -21,7 +22,7 @@ import { ChatMessage } from '../messages/message.types';
  *   1. Every push uses an ack callback with a timeout.
  *   2. No ack -> retry a few times while connected.
  *   3. Still no ack / disconnected -> message stays pending in the inbox.
- *   4. On (re)connect the client emits `sync`; the server replays all pending.
+ *   4. On (re)connect the client emits `sync`; the server replays everything THIS DEVICE has not acked.
  *   5. The client drops duplicates by message id.
  */
 @WebSocketGateway({ cors: { origin: '*' } })
@@ -34,18 +35,21 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   constructor(
     private readonly messages: MessagesService,
     private readonly presence: PresenceService,
+    private readonly jwt: JwtService,
   ) {}
 
-  handleConnection(client: Socket) {
-    // Real apps: verify a JWT here instead of trusting a userId.
-    const userId = client.handshake.auth?.userId as string | undefined;
-    if (!userId) {
+  async handleConnection(client: Socket) {
+    const { token, deviceId } = client.handshake.auth ?? {};
+    try {
+      if (!token || !deviceId) throw new Error('token and deviceId required');
+      client.data.userId = (await this.jwt.verifyAsync(token)).sub as string;
+      client.data.deviceId = deviceId as string;
+    } catch {
       client.disconnect(true);
       return;
     }
-    client.data.userId = userId;
-    this.presence.addSocket(userId, client.id);
-    this.logger.log(`${userId} connected (${client.id})`);
+    await this.presence.addConnection(client.data.userId, client.id);
+    this.logger.log(`${client.data.userId}/${deviceId} connected (${client.id})`);
   }
 
   handleDisconnect(client: Socket) {
@@ -53,7 +57,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (!userId) return;
     this.unsubscribers.get(client.id)?.();
     this.unsubscribers.delete(client.id);
-    this.presence.removeSocket(userId, client.id);
+    void this.presence.removeConnection(userId, client.id);
     this.logger.log(`${userId} disconnected (${client.id})`);
   }
 
@@ -62,36 +66,37 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
    * both happen synchronously so no message can slip through the gap.
    */
   @SubscribeMessage('sync')
-  handleSync(@ConnectedSocket() client: Socket) {
-    const userId = client.data.userId as string;
-    const pending = this.messages.getPending(userId);
-    pending.forEach((m) => this.deliver(client, m));
-
+  async handleSync(@ConnectedSocket() client: Socket) {
+    const { userId, deviceId } = client.data;
+    // Subscribe first, then replay: a message landing in between is delivered twice at worst, never lost.
     this.unsubscribers.get(client.id)?.();
-    this.unsubscribers.set(
-      client.id,
-      this.messages.onMessage(userId, (m) => this.deliver(client, m)),
-    );
+    this.unsubscribers.set(client.id, this.messages.onMessage(userId, (m) => this.deliver(client, m)));
+    const pending = await this.messages.getPending(userId, deviceId);
+    pending.forEach((m) => this.deliver(client, m));
     return { replayed: pending.length }; // returned value = ack to the client's emit
   }
 
   /** Clients can also send over the socket instead of HTTP POST. */
   @SubscribeMessage('send')
-  handleSend(@ConnectedSocket() client: Socket, @MessageBody() body: { to: string; text: string }) {
+  async handleSend(@ConnectedSocket() client: Socket, @MessageBody() body: { to: string; text: string }) {
     if (!body?.to || !body?.text?.trim()) return { ok: false, error: 'to and text are required' };
-    const message = this.messages.send(client.data.userId, body.to, body.text.trim());
-    return { ok: true, message, recipientOnline: this.presence.isOnline(body.to) };
+    try {
+      const message = await this.messages.send(client.data.userId, body.to, 'chat', { text: body.text.trim() });
+      return { ok: true, message, recipientOnline: await this.presence.isOnline(body.to) };
+    } catch (e) {
+      return { ok: false, error: (e as Error).message };
+    }
   }
 
-  private deliver(client: Socket, message: ChatMessage, attempt = 1) {
-    const userId = client.data.userId as string;
-    if (!client.connected || !this.messages.isPending(userId, message.seq)) return;
+  private async deliver(client: Socket, message: ChatMessage, attempt = 1) {
+    const { userId, deviceId } = client.data;
+    if (!client.connected || !(await this.messages.isPending(userId, deviceId, message.seq))) return;
 
     client
       .timeout(this.ACK_TIMEOUT_MS)
       .emit('message', { ...message, attempt }, (err: Error | null) => {
         if (!err) {
-          this.messages.ackOne(userId, message.seq);
+          void this.messages.ackOne(userId, deviceId, message.seq);
           return;
         }
         if (attempt < this.MAX_ATTEMPTS) {
